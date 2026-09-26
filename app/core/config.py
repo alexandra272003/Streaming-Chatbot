@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     # summary instead of sent verbatim.
     keep_recent_messages: int = 6
 
+    # Day 25: provider reliability
+    llm_timeout_seconds: float = 30.0
+    llm_max_retries: int = 2
+    llm_retry_backoff_seconds: float = 0.5
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

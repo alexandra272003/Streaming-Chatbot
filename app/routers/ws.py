@@ -1,10 +1,13 @@
 import json
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from openai import APIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_session
+from app.core.errors import AppError
 from app.core.llm_client import stream_chat_completion
+from app.core.moderation import validate_user_input
 from app.repositories import conversation_repository as repo
 from app.services.chat_service import build_llm_context
 
@@ -18,33 +21,29 @@ async def chat_websocket(
     session: AsyncSession = Depends(get_session),
 ):
     """
-    Day 23: WebSocket chat mode. Unlike SSE (one plain HTTP response kept
-    open, server -> client only), a WebSocket is a genuinely different,
-    full-duplex connection -- the client can send new messages over the
-    SAME open connection at any time, without opening a new HTTP request
-    each time. Overkill for pure LLM token output, but this is exactly
-    the shape needed for, e.g., a client that also wants to send
-    "stop generating" or presence/typing events mid-stream.
-
-    FastAPI supports Depends() in WebSocket routes the same as HTTP routes
-    -- session is resolved once when the connection is accepted and stays
-    open for the whole connection's lifetime, which is exactly right for
-    a WebSocket (one long-lived exchange, not one-shot request/response).
-    Using Depends() here (instead of importing SessionLocal directly) is
-    also what makes this endpoint testable with a swapped-in test database,
-    the same way every HTTP endpoint in this project already is.
-
-    Connection lifecycle: accept() opens it, a loop receives messages
-    until the client disconnects (WebSocketDisconnect), then that
-    exception is caught so the handler exits cleanly instead of crashing.
+    Day 23 (WebSocket) + Day 25 (reliability) combined. FastAPI resolves
+    Depends(get_session) once, when the connection is accepted -- the same
+    session is then reused for every message received over this
+    connection's whole lifetime, matching a WebSocket's own long-lived
+    shape (unlike HTTP, where a fresh session is created and torn down per
+    request).
     """
     await websocket.accept()
 
     try:
         while True:
             raw = await websocket.receive_text()
-            data = json.loads(raw)
-            content = data.get("content", "")
+
+            # Bad input is reported back to the client, not allowed to
+            # kill the whole connection -- one malformed message shouldn't
+            # force a full reconnect.
+            try:
+                data = json.loads(raw)
+                content = validate_user_input(data.get("content", ""))
+            except (json.JSONDecodeError, AttributeError, AppError) as exc:
+                message = getattr(exc, "message", "Malformed message")
+                await websocket.send_json({"type": "error", "message": message})
+                continue
 
             conversation = await repo.get_conversation(session, conversation_id)
             if conversation is None:
@@ -59,19 +58,34 @@ async def chat_websocket(
             llm_messages = await build_llm_context(session, conversation_id)
 
             collected = ""
-            async for token in stream_chat_completion(llm_messages):
-                collected += token
-                await websocket.send_json({"type": "token", "delta": token})
-
-            if collected:
-                assistant_message = await repo.add_message(
-                    session, conversation_id, "assistant", collected
+            failed = False
+            assistant_id = None
+            try:
+                async for token in stream_chat_completion(llm_messages):
+                    collected += token
+                    await websocket.send_json({"type": "token", "delta": token})
+            except APIError:
+                failed = True
+                await websocket.send_json(
+                    {"type": "error", "message": "The language model provider failed to respond"}
                 )
-                await websocket.send_json({"type": "done", "id": assistant_message.id})
+            finally:
+                # Runs on normal completion, a provider failure, AND
+                # implicitly on client disconnect (send_json raising) --
+                # partial replies are kept in every case, mirroring the
+                # SSE path's own guarantee.
+                if collected:
+                    assistant_message = await repo.add_message(
+                        session, conversation_id, "assistant", collected
+                    )
+                    assistant_id = assistant_message.id
+
+            if not failed and assistant_id is not None:
+                await websocket.send_json({"type": "done", "id": assistant_id})
 
     except WebSocketDisconnect:
-        # Client closed the tab / lost connection -- nothing to send a
-        # response to anymore. No special cleanup needed beyond this catch;
-        # the get_session dependency's own "async with" handles closing
-        # the DB session regardless of how the handler exits.
+        # Client closed the tab / lost connection -- there's no socket
+        # left to send anything to. A disconnect ends the WHOLE
+        # connection, not just the current message, so this is only
+        # caught at the outer loop level, not per-message.
         pass

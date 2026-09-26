@@ -157,6 +157,24 @@ once; SSE and WebSocket visibly fill in token-by-token.
 Just make sure the API's CORS is enabled (`app/main.py` already allows all origins for this reason)
 and that `docker compose up` is running before opening the console.
 
-# Streaming-Chatbot
-# Streaming-Chatbot
-# Streaming-Chatbot
+## Day 25: reliability — retries, timeouts, moderation
+
+`app/core/llm_client.py` wraps every call to the provider in `_with_retries` — exponential backoff
+(`base * 2^attempt`) for genuinely transient errors only (`APITimeoutError`, `APIConnectionError`,
+`RateLimitError`, `InternalServerError`). An auth error or a bad request fails identically on every
+attempt, so those are deliberately *not* retried — retrying them would only waste time before the
+client gets a clear, actionable error. The SDK's own built-in retries are explicitly disabled
+(`max_retries=0`) so retry behavior lives in exactly one place, not two potentially-conflicting
+systems.
+
+**Retries stop the moment a stream opens.** Once `stream_chat_completion` starts yielding tokens,
+a mid-stream failure is *not* retried — some tokens may already be sent to the actual client, and
+silently opening a second, independent completion request would mean the client sees duplicated or
+reordered text. Instead, both `stream.py` and `ws.py` catch that failure explicitly, persist
+whatever partial reply was collected, and emit a proper `error` event — proven directly by
+`test_stream_failure_midway_persists_partial_and_emits_error`.
+
+`app/core/moderation.py` adds `validate_user_input`, called before anything is persisted or sent to
+the LLM: rejects empty/whitespace-only messages and oversized input, with a pluggable
+`moderation_hook` slot for a real content-policy check later. Validating *before* saving (not after)
+keeps the database's contents meaningfully clean — junk input never becomes a permanent row.
