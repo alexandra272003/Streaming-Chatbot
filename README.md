@@ -1,74 +1,92 @@
-# Streaming Chatbot — Week 4, Day 21 (non-streaming baseline)
+# Streaming Chatbot
 
-A chat backend that persists conversations and messages, and calls an
-LLM to generate replies. This is the **non-streaming baseline** — the
-client sends a message and waits for the complete reply. Tomorrow (Day 22)
-adds Server-Sent Events so the same reply streams token-by-token instead.
+A FastAPI chat backend that persists conversations in PostgreSQL and generates replies through an OpenAI-compatible LLM (built and tested against Groq), with three interchangeable ways of delivering a reply: a plain HTTP response, Server-Sent Events, and WebSocket. Built as Week 4 of a 60-day backend + GenAI sprint (Day 21–25).
 
-## Why build the non-streaming version first
+## What this project demonstrates
 
-Streaming adds real complexity — partial responses, disconnect handling,
-backpressure. Getting the actual chat logic (persistence, history,
-provider calls, error handling) working and tested *without* streaming
-first means Day 22 only has to add ONE new concept (SSE), not several at
-once.
+- A real LLM integration wrapped in a genuine reliability layer (timeouts, exponential-backoff retries, input validation) — not just a raw API call
+- Three transport strategies (HTTP, SSE, WebSocket) sharing one identical core of business logic, rather than three diverging copies
+- Deliberate correctness under failure: nothing the user typed is ever lost, even when the provider fails mid-reply
+- Unbounded conversation growth solved with a rolling summary instead of an unbounded token bill or a silent memory cutoff
 
 ## Stack
 
-Same layered pattern as every previous project: router → service →
-repository. New this week: `app/core/llm_client.py`, a thin wrapper
-around the OpenAI-compatible client — the **only** place in the app that
-talks to the LLM provider directly.
+| Concern | Choice |
+|---|---|
+| API | FastAPI (async) |
+| Database | PostgreSQL + SQLAlchemy (async) + Alembic migrations |
+| LLM provider | Any OpenAI-compatible API (built and verified against Groq) |
+| Testing | pytest + SQLite (fast, no real infra needed) |
+| Container | Docker Compose (API + Postgres) |
 
-## The conversation/message data model
+Same router → service → repository layering as every earlier project in the sprint. New this week: `app/core/llm_client.py` — the one and only place the app talks to the LLM provider directly.
 
-Two tables: `conversations` (just an id, title, created_at) and
-`messages` (belongs to a conversation, has a `role` — `user`,
-`assistant`, or `system` — and `content`). Every message, from both the
-user and the assistant, is stored as its own row in chronological order.
+## Data model
 
-## Why the user's message is saved *before* calling the LLM
+Two tables, linked by a foreign key:
 
-In `app/services/chat_service.py`:
+- **`conversations`** — `id`, `title`, `created_at`, plus `summary` and `summarized_through_id` (added Day 24 — see [Context budgeting](#context-budgeting-day-24) below)
+- **`messages`** — `id`, `conversation_id`, `role` (`user` / `assistant` / `system`), `content`, `created_at`
+
+Every message, from both the user and the assistant, is its own row, in chronological order.
+
+## The three ways to send a message
+
+All three call the exact same underlying logic (`chat_service.build_llm_context` and the same save-order guarantee) — they only differ in how the reply gets back to the client.
+
+| Mode | Endpoint | Behavior |
+|---|---|---|
+| **Baseline** (Day 21) | `POST /conversations/{id}/messages` | Client waits silently; one complete JSON response once the full reply is ready |
+| **SSE** (Day 22) | `POST /conversations/{id}/messages/stream` | Same request, but the connection stays open and the reply arrives as small `event: token` frames as it's generated |
+| **WebSocket** (Day 23) | `ws://.../ws/conversations/{id}` | A persistent, full-duplex connection — the client can send many messages over one connection without reopening it each time |
+
+**Why build the non-streaming version first?** Streaming adds real complexity on its own — partial responses, disconnect handling, backpressure. Getting the core chat logic (persistence, history, provider calls, error handling) working and tested *without* streaming first meant each later mode only had to add one new concept at a time, not several at once.
+
+**Why SSE before WebSocket, and why bother with WebSocket at all?** LLM token output is inherently one-directional (server → client), which is exactly what SSE is built for — it reuses plain HTTP with no new protocol. WebSocket is genuinely more capable (full-duplex, either side can send anytime) but that capability isn't needed for pure token streaming; it's included specifically to demonstrate the second mode and to be the right shape *if* a client later needs to send something mid-stream (a "stop generating" signal, a typing indicator).
+
+## Why the user's message is saved before the LLM is even called
 
 ```python
+# app/services/chat_service.py
 user_message = await repo.add_message(session, conversation_id, "user", content)
 # ... only then call the LLM
 reply_text = await get_chat_completion(llm_messages)
 ```
 
-If the LLM call fails — timeout, rate limit, provider outage — the
-user's message is already safely persisted. Nothing they typed is lost,
-even if the assistant never manages to reply. This is proven directly by
-`test_user_message_persisted_even_if_llm_call_would_fail`.
+If the LLM call fails — timeout, rate limit, provider outage — the user's message is already safely committed. Nothing they typed is ever lost, even if the assistant never manages to reply. Proven directly by `test_user_message_persisted_even_if_llm_call_would_fail`.
 
-## Why conversation history is sent on every call, not just the latest message
+## Why full conversation history is resent on every single call
 
-LLMs are stateless between API calls — the provider has no memory of
-your previous messages unless you send them again yourself. Every call
-to `get_chat_completion` includes the last `max_history_messages`
-messages (default 20), not just the newest one, which is what lets the
-assistant "remember" earlier things you said within the same
-conversation. Proven by `test_history_sent_to_llm_includes_prior_messages`.
+LLM providers are stateless between API calls — there is no memory of prior messages unless the client resends them. Every call to the provider includes the most recent messages (bounded by `max_history_messages`, default 20), which is what creates the appearance of the assistant "remembering" earlier turns in the same conversation. Proven by `test_history_sent_to_llm_includes_prior_messages`.
 
-This also sets up **Day 24's** problem directly: conversation history
-can't grow unboundedly forever — every message sent costs tokens (and
-therefore money and latency), and eventually exceeds the model's context
-window. That's why `max_history_messages` already exists as a hard cap,
-even though truncation/summarization strategy itself isn't built until
-Day 24.
+This also creates the problem Day 24 solves: history can't just grow forever — every message resent costs tokens (money and latency), and eventually exceeds the model's context window entirely.
+
+## Context budgeting (Day 24)
+
+`build_llm_context()` in `app/services/chat_service.py`:
+
+1. Always keeps the most recent `keep_recent_messages` (default 6) verbatim.
+2. Once total messages exceed `max_history_messages` (default 20), folds everything *older* than that recent window into a running summary via one extra LLM call.
+3. Tracks `summarized_through_id` on the conversation so already-summarized messages are never re-summarized on a later call — only genuinely new old messages get folded in each time.
+
+If the summarization call itself fails, it's treated as best-effort: the existing summary (or none) is kept, and the conversation continues working normally on the unsummarized recent window. Summarization is an optimization, not core functionality — a hiccup compressing old history should never block a reply to what the user just typed.
+
+This logic is shared by all three endpoints — context budgeting lives in exactly one place, never duplicated per transport mode.
+
+## Reliability: retries, timeouts, input validation (Day 25)
+
+`app/core/llm_client.py` wraps every provider call in `_with_retries`: exponential backoff (`base * 2^attempt`) for genuinely transient errors only — `APITimeoutError`, `APIConnectionError`, `RateLimitError`, `InternalServerError`. An auth error or a malformed request fails identically on every attempt, so those are deliberately *not* retried, since retrying them would only delay the client getting a clear, actionable error. The SDK's own built-in retry support is explicitly disabled (`max_retries=0`) so retry behavior lives in exactly one place, not two potentially-conflicting systems.
+
+**Retries stop the moment a stream opens.** Once `stream_chat_completion` starts yielding tokens, a mid-stream failure is *not* retried — some tokens may already have reached the client, and silently opening a second, independent request would mean the client sees duplicated or reordered text. Instead, both `stream.py` and `ws.py` catch that failure explicitly, persist whatever partial reply was already collected, and emit an `error` event to the client — proven by `test_stream_failure_midway_persists_partial_and_emits_error`.
+
+`app/core/moderation.py` adds `validate_user_input`, called before anything is persisted or sent to the LLM: rejects empty/whitespace-only messages and oversized input, with a pluggable `moderation_hook` slot for a real content-policy check later. Validating *before* saving — not after — keeps the database's contents meaningfully clean; rejected input never becomes a permanent row.
 
 ## Running it for real
 
-Requires a real API key (OpenAI, or any OpenAI-compatible provider):
-
 ```bash
 cp .env.example .env
-# edit .env and paste in a real LLM_API_KEY
+# edit .env and set a real LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL
 docker compose up --build
-```
-
-```bash
 curl http://127.0.0.1:8000/ping
 ```
 
@@ -85,6 +103,12 @@ curl -X POST http://127.0.0.1:8000/conversations/1/messages -H "Content-Type: ap
 curl http://127.0.0.1:8000/conversations/1
 ```
 
+Open `chat-console.html` directly in a browser (no build step, no server needed for the UI itself) to try all three modes side by side via a dropdown — baseline waits silently then dumps the whole reply at once; SSE and WebSocket visibly fill in token-by-token. Make sure `docker compose up` is running first; CORS is already wide open in `app/main.py` for exactly this purpose.
+
+### Groq-specific note
+
+This project was built and verified against Groq's OpenAI-compatible endpoint (`LLM_BASE_URL=https://api.groq.com/openai/v1`). As of testing, `llama-3.3-70b-versatile` and `llama-3.1-8b-instant` had moved to Groq's Enterprise/Contact-Sales tier and return `model_not_found` on a standard developer key. `openai/gpt-oss-20b` is confirmed working on the free tier and is the default in `.env.example`. Check [Groq's current model list](https://console.groq.com/docs/models) if you hit a `model_not_found` error — provider-hosted model availability can change independently of this code.
+
 ## Running tests (no API key or Docker required)
 
 ```bash
@@ -92,89 +116,25 @@ pip install -r requirements.txt
 pytest -v
 ```
 
-9 tests, all passing. The LLM call is mocked (`tests/conftest.py`) — the
-test suite never makes a real network call or needs a real API key, same
-"fast fake" philosophy as every previous project's mongomock/SQLite/
-fakeredis approach.
+The LLM is fully mocked in `tests/conftest.py` — the suite never makes a real network call or needs a real API key, the same "fast fake" philosophy as every earlier project's mongomock/SQLite/fakeredis approach. Covers: baseline chat, SSE streaming, WebSocket streaming, summarization triggering and persistence, and provider failure/retry behavior.
 
-## What's deliberately not done yet (Day 21-24 scope)
+## API reference
 
-- **No timeout/retry handling for the LLM provider** — arrives Day 25
-- **No auth** — anyone can create conversations and send messages
-- **No load testing** — arrives Day 26
+| Method & path | Purpose |
+|---|---|
+| `GET /ping` | Health check |
+| `POST /conversations` | Create a conversation |
+| `GET /conversations/{id}` | Get a conversation with its full message history and summary |
+| `POST /conversations/{id}/messages` | Send a message, wait for the full reply (Day 21) |
+| `POST /conversations/{id}/messages/stream` | Send a message, receive the reply via SSE (Day 22) |
+| `ws://.../ws/conversations/{id}` | Persistent WebSocket chat connection (Day 23) |
 
-## Day 22: SSE token streaming
+## What's deliberately not done yet
 
-`POST /conversations/{id}/messages/stream` (`app/routers/stream.py`) sends the same reply as the
-baseline endpoint, but forwards each token to the client as it's generated instead of waiting for
-the whole thing. Implemented with a plain `StreamingResponse` and `media_type="text/event-stream"` —
-no special protocol beyond keeping one HTTP response open and formatting each chunk as
-`data: {...}\n\n`.
+- **No authentication** — anyone can create conversations and send messages
+- **No load testing**
+- **No content moderation implementation** — the hook exists (`moderation_hook` in `app/core/moderation.py`) but is unwired; a real provider-backed check would plug in here
 
-**Disconnect handling:** the generator checks `await request.is_disconnected()` on every token and
-stops calling the LLM provider the moment the client goes away — no point generating (and paying for)
-tokens nobody will receive. Whatever was generated before the disconnect is still persisted, so a
-cancelled stream doesn't lose a partial reply.
+## A real, live-found issue worth knowing about
 
-## Day 23: WebSocket chat mode
-
-`ws://.../ws/conversations/{id}` (`app/routers/ws.py`) is a genuinely different kind of connection
-from SSE — full-duplex, meaning the client can send new messages over the *same* open connection at
-any time, rather than opening a new HTTP request per message. Overkill for pure LLM token output
-alone, but this is the right shape if a client also needs to send things like "stop generating" or
-typing-indicator events mid-stream.
-
-**A real bug caught and fixed while building this:** the first version imported `SessionLocal`
-directly instead of using the same `get_session` dependency every HTTP route uses. That silently
-bypassed test database overrides — the WebSocket route would have always hit the real configured
-database, even in tests, with no error to signal it. Fixed by using `Depends(get_session)` in the
-WebSocket handler too (FastAPI supports dependency injection for WebSocket routes the same as HTTP),
-which is also what makes `tests/test_websocket.py` able to test it against a real, swapped-in test
-database.
-
-## Day 24: conversation history truncation/summarization
-
-Every message ever sent in a conversation being resent to the LLM on every call would mean unbounded
-token growth — rising cost and latency, eventually exceeding the model's context window entirely.
-`build_llm_context()` in `app/services/chat_service.py`:
-
-1. Always keeps the most recent `keep_recent_messages` (default 6) verbatim.
-2. Once total messages exceed `max_history_messages` (default 20), folds everything *older* than that
-   recent window into a running summary via one extra LLM call.
-3. Tracks `summarized_through_id` on the conversation so already-summarized messages are never
-   re-summarized on a later call — only genuinely new old messages get folded in each time.
-
-This is shared by all three endpoints (baseline, SSE, WebSocket) — the context-budgeting logic lives
-in exactly one place, not duplicated per streaming mode.
-
-## The chat console UI
-
-`chat-console.html` is a single self-contained file — open it directly in a browser (no build step,
-no server needed for the UI itself). It supports all three modes (baseline, SSE, WebSocket) via a
-dropdown, so you can compare them side by side: baseline waits silently then dumps the whole reply at
-once; SSE and WebSocket visibly fill in token-by-token.
-
-Just make sure the API's CORS is enabled (`app/main.py` already allows all origins for this reason)
-and that `docker compose up` is running before opening the console.
-
-## Day 25: reliability — retries, timeouts, moderation
-
-`app/core/llm_client.py` wraps every call to the provider in `_with_retries` — exponential backoff
-(`base * 2^attempt`) for genuinely transient errors only (`APITimeoutError`, `APIConnectionError`,
-`RateLimitError`, `InternalServerError`). An auth error or a bad request fails identically on every
-attempt, so those are deliberately *not* retried — retrying them would only waste time before the
-client gets a clear, actionable error. The SDK's own built-in retries are explicitly disabled
-(`max_retries=0`) so retry behavior lives in exactly one place, not two potentially-conflicting
-systems.
-
-**Retries stop the moment a stream opens.** Once `stream_chat_completion` starts yielding tokens,
-a mid-stream failure is *not* retried — some tokens may already be sent to the actual client, and
-silently opening a second, independent completion request would mean the client sees duplicated or
-reordered text. Instead, both `stream.py` and `ws.py` catch that failure explicitly, persist
-whatever partial reply was collected, and emit a proper `error` event — proven directly by
-`test_stream_failure_midway_persists_partial_and_emits_error`.
-
-`app/core/moderation.py` adds `validate_user_input`, called before anything is persisted or sent to
-the LLM: rejects empty/whitespace-only messages and oversized input, with a pluggable
-`moderation_hook` slot for a real content-policy check later. Validating *before* saving (not after)
-keeps the database's contents meaningfully clean — junk input never becomes a permanent row.
+During manual testing, the smaller free-tier model occasionally began spontaneously re-summarizing the entire conversation on nearly every turn once summarization kicked in, rather than treating the injected summary as passive background context. This looks like a smaller model misinterpreting the injected `system`-role summary as a standing instruction rather than inert context — a known class of behavior in smaller LLMs. Not fixed (summarization mechanics are proven working regardless), but worth knowing if replies start looking unexpectedly repetitive: try strengthening the system prompt's wording, or test with a larger model for the summarization call specifically.
